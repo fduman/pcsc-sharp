@@ -136,7 +136,8 @@ namespace PCSC.Iso7816
         }
 
         private ResponseApdu SimpleTransmit(byte[] commandApdu, int commandApduLength, IsoCase isoCase,
-            SCardProtocol protocol, SCardPCI receivePci, byte[] receiveBuffer, int receiveBufferLength) {
+            SCardProtocol protocol, SCardPCI receivePci, byte[] receiveBuffer, int receiveBufferLength,
+            Func<ResponseApdu, ResponseApdu> afterTransmit) {
             SCardError sc;
             do {
                 // send Command APDU to the card
@@ -166,19 +167,27 @@ namespace PCSC.Iso7816
                 sc.Throw();
             }
 
-            return new ResponseApdu(receiveBuffer, receiveBufferLength, isoCase, protocol);
+            var responseApdu = new ResponseApdu(receiveBuffer, receiveBufferLength, isoCase, protocol);
+
+            if (afterTransmit != null) {
+                responseApdu = afterTransmit(responseApdu);
+            }
+
+            return responseApdu;
         }
 
         /// <summary>Transmits the specified command APDU.</summary>
         /// <param name="commandApdu">The command APDU.</param>
         /// <returns>A response containing one ore more <see cref="ResponseApdu" />.</returns>
-        public virtual Response Transmit(CommandApdu commandApdu) => Transmit(commandApdu, ConstructGetResponseApdu);
+        public virtual Response Transmit(CommandApdu commandApdu, Func<ResponseApdu, ResponseApdu> afterTransmit) =>
+            Transmit(commandApdu, ConstructGetResponseApdu, afterTransmit);
 
         /// <summary>Transmits the specified command APDU.</summary>
         /// <param name="commandApdu">The command APDU.</param>
         /// <param name="constructGetResponse">A method that will be called if the card signals more data available (SW1=0x61)</param>
         /// <returns>A response containing one ore more <see cref="ResponseApdu" />.</returns>
-        public virtual Response Transmit(CommandApdu commandApdu, ConstructGetResponse constructGetResponse) {
+        public virtual Response Transmit(CommandApdu commandApdu, ConstructGetResponse constructGetResponse,
+            Func<ResponseApdu, ResponseApdu> afterTransmit) {
             if (commandApdu == null) {
                 throw new ArgumentNullException(nameof(commandApdu));
             }
@@ -210,7 +219,7 @@ namespace PCSC.Iso7816
                     commandApdu.Protocol, // Protocol used by the Command APDU
                     receivePci,
                     receiveBuffer,
-                    receiveBufferLength);
+                    receiveBufferLength, afterTransmit);
             } catch (WinErrorInsufficientBufferException ex) {
                 throw new InvalidApduException($"Unsufficient buffer: check Le size (Le={commandApdu.Le})", ex);
             }
@@ -222,7 +231,7 @@ namespace PCSC.Iso7816
              */
             if (responseApdu.SW1 == (byte) SW1Code.ErrorP3Incorrect) {
                 // Case 1: SW1=0x6c, Previous Le/P3 not accepted -> Set le = SW2
-                responseApdu = RetransmitOnInsufficientBuffer(commandApdu, responseApdu, out receivePci);
+                responseApdu = RetransmitOnInsufficientBuffer(commandApdu, responseApdu, out receivePci, afterTransmit);
             }
 
             // create Response object
@@ -230,7 +239,8 @@ namespace PCSC.Iso7816
 
             if (responseApdu.SW1 == (byte) SW1Code.NormalDataResponse) {
                 // Case 2: SW1=0x61, More data available -> GET RESPONSE
-                responseApdu = IssueGetResponseCommand(commandApdu, responseApdu, response, receivePci, constructGetResponse);
+                responseApdu = IssueGetResponseCommand(commandApdu, responseApdu, response, receivePci,
+                    constructGetResponse, afterTransmit);
             }
 
             response.Add(responseApdu);
@@ -244,7 +254,7 @@ namespace PCSC.Iso7816
             ResponseApdu previousResponseApdu,
             Response response,
             SCardPCI receivePci,
-            ConstructGetResponse constructGetResponse) {
+            ConstructGetResponse constructGetResponse, Func<ResponseApdu, ResponseApdu> afterTransmit) {
             /* The transmission system shall issue a GET RESPONSE command APDU (or TPDU)
              * to the card by assigning the minimum of SW2 and Le to parameter Le (or P3)).
              * Le = Le > 0 ? min(Le,SW2) : SW2
@@ -286,7 +296,7 @@ namespace PCSC.Iso7816
                         getResponseApdu.Protocol,
                         receivePci,
                         receiveBuffer,
-                        receiveBufferLength);
+                        receiveBufferLength, afterTransmit);
                 } catch (WinErrorInsufficientBufferException ex) {
                     throw new InvalidApduException(
                         $"GET RESPONSE command failed because of unsufficient buffer (Le={getResponseApdu.Le})",
@@ -309,7 +319,7 @@ namespace PCSC.Iso7816
         }
 
         private ResponseApdu RetransmitOnInsufficientBuffer(CommandApdu commandApdu, ResponseApdu responseApdu,
-            out SCardPCI receivePci) {
+            out SCardPCI receivePci, Func<ResponseApdu, ResponseApdu> afterTransmit) {
             int receiveBufferLength;
             var resendCmdApdu = (CommandApdu) commandApdu.Clone();
             if (responseApdu.SW2 == 0) {
@@ -339,7 +349,7 @@ namespace PCSC.Iso7816
                     resendCmdApdu.Protocol,
                     receivePci,
                     receiveBuffer,
-                    receiveBufferLength);
+                    receiveBufferLength, afterTransmit);
             } catch (WinErrorInsufficientBufferException ex) {
                 throw new InvalidApduException(
                     $"Retransmission failed because of unsufficient buffer. Le={resendCmdApdu.Le}", ex);
