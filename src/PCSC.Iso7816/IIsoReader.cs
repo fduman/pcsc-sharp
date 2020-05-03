@@ -38,6 +38,6 @@ namespace PCSC.Iso7816
         /// <summary>Transmits the specified command APDU.</summary>
         /// <param name="commandApdu">The command APDU.</param>
         /// <returns>A response containing one ore more <see cref="ResponseApdu" />.</returns>
-        Response Transmit(CommandApdu commandApdu, Func<ResponseApdu, ResponseApdu> afterTransmit);
+        Response Transmit(CommandApdu commandApdu);
     }
 }

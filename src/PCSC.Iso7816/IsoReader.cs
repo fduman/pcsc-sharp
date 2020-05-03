@@ -15,6 +15,8 @@ namespace PCSC.Iso7816
         private readonly bool _releaseContextOnDispose;
         private readonly bool _disconnectReaderOnDispose;
         private readonly ISCardReader _reader;
+        private readonly Func<CommandApdu, CommandApdu> _beforeTransmit;
+        private readonly Func<ResponseApdu, ResponseApdu> _afterTransmit;
 
         private int _maxReceiveSize = DefaultMaxReceiveSize;
 
@@ -68,11 +70,15 @@ namespace PCSC.Iso7816
         /// <param name="context">A context to the PC/SC Resource Manager.</param>
         /// <param name="releaseContextOnDispose">if set to <c>true</c> the <paramref name="context" /> will be released on <see cref="Dispose()" />.</param>
         /// <exception cref="System.ArgumentNullException">If <paramref name="context" /> is <see langword="null" /></exception>
-        public IsoReader(ISCardContext context, bool releaseContextOnDispose = false) {
+        public IsoReader(ISCardContext context, bool releaseContextOnDispose = false,
+            Func<CommandApdu, CommandApdu> beforeTransmit = null,
+            Func<ResponseApdu, ResponseApdu> afterTransmit = null) {
             _context = context ?? throw new ArgumentNullException(nameof(context));
             _reader = new SCardReader(context);
             _releaseContextOnDispose = releaseContextOnDispose;
             _disconnectReaderOnDispose = true;
+            _beforeTransmit = beforeTransmit;
+            _afterTransmit = afterTransmit;
         }
 
         /// <summary>Initializes a new instance of the <see cref="IsoReader" /> class that will create its own instance of a <see cref="SCardReader" /> and immediately connect.</summary>
@@ -82,8 +88,11 @@ namespace PCSC.Iso7816
         /// <param name="protocol">The communication protocol. <seealso cref="ISCardReader.Connect(string,SCardShareMode,SCardProtocol)" /></param>
         /// <param name="releaseContextOnDispose">if set to <c>true</c> the <paramref name="context" /> will be released on <see cref="Dispose()" />.</param>
         public IsoReader(ISCardContext context, string readerName, SCardShareMode mode, SCardProtocol protocol,
-            bool releaseContextOnDispose = true)
-            : this(context, readerName, mode, protocol, releaseContextOnDispose, DefaultMaxReceiveSize) {}
+            bool releaseContextOnDispose = true,
+            Func<CommandApdu, CommandApdu> beforeTransmit = null,
+            Func<ResponseApdu, ResponseApdu> afterTransmit = null)
+            : this(context, readerName, mode, protocol, releaseContextOnDispose, DefaultMaxReceiveSize,
+                beforeTransmit, afterTransmit) {}
 
         /// <summary>Initializes a new instance of the <see cref="IsoReader" /> class that will create its own instance of a <see cref="SCardReader" /> and immediately connect.</summary>
         /// <param name="context">A context to the PC/SC Resource Manager.</param>
@@ -93,8 +102,10 @@ namespace PCSC.Iso7816
         /// <param name="releaseContextOnDispose">if set to <c>true</c> the <paramref name="context" /> will be released on <see cref="Dispose()" />.</param>
         /// <param name="maxReceiveSize">Sets the maximum number of bytes that can be received (Le) when using a <see cref="InstructionCode.GetResponse"/> command.</param>
         public IsoReader(ISCardContext context, string readerName, SCardShareMode mode, SCardProtocol protocol,
-            bool releaseContextOnDispose, int maxReceiveSize)
-            : this(context, releaseContextOnDispose) {
+            bool releaseContextOnDispose, int maxReceiveSize,
+            Func<CommandApdu, CommandApdu> beforeTransmit = null,
+            Func<ResponseApdu, ResponseApdu> afterTransmit = null)
+            : this(context, releaseContextOnDispose, beforeTransmit, afterTransmit) {
             _maxReceiveSize = maxReceiveSize;
             Connect(readerName, mode, protocol);
         }
@@ -136,9 +147,9 @@ namespace PCSC.Iso7816
         }
 
         private ResponseApdu SimpleTransmit(byte[] commandApdu, int commandApduLength, IsoCase isoCase,
-            SCardProtocol protocol, SCardPCI receivePci, byte[] receiveBuffer, int receiveBufferLength,
-            Func<ResponseApdu, ResponseApdu> afterTransmit) {
+            SCardProtocol protocol, SCardPCI receivePci, byte[] receiveBuffer, int receiveBufferLength) {
             SCardError sc;
+
             do {
                 // send Command APDU to the card
                 sc = _reader.Transmit(
@@ -167,27 +178,19 @@ namespace PCSC.Iso7816
                 sc.Throw();
             }
 
-            var responseApdu = new ResponseApdu(receiveBuffer, receiveBufferLength, isoCase, protocol);
-
-            if (afterTransmit != null) {
-                responseApdu = afterTransmit(responseApdu);
-            }
-
-            return responseApdu;
+            return new ResponseApdu(receiveBuffer, receiveBufferLength, isoCase, protocol);
         }
 
         /// <summary>Transmits the specified command APDU.</summary>
         /// <param name="commandApdu">The command APDU.</param>
         /// <returns>A response containing one ore more <see cref="ResponseApdu" />.</returns>
-        public virtual Response Transmit(CommandApdu commandApdu, Func<ResponseApdu, ResponseApdu> afterTransmit) =>
-            Transmit(commandApdu, ConstructGetResponseApdu, afterTransmit);
+        public virtual Response Transmit(CommandApdu commandApdu) => Transmit(commandApdu, ConstructGetResponseApdu);
 
         /// <summary>Transmits the specified command APDU.</summary>
         /// <param name="commandApdu">The command APDU.</param>
         /// <param name="constructGetResponse">A method that will be called if the card signals more data available (SW1=0x61)</param>
         /// <returns>A response containing one ore more <see cref="ResponseApdu" />.</returns>
-        public virtual Response Transmit(CommandApdu commandApdu, ConstructGetResponse constructGetResponse,
-            Func<ResponseApdu, ResponseApdu> afterTransmit) {
+        public virtual Response Transmit(CommandApdu commandApdu, ConstructGetResponse constructGetResponse) {
             if (commandApdu == null) {
                 throw new ArgumentNullException(nameof(commandApdu));
             }
@@ -196,16 +199,19 @@ namespace PCSC.Iso7816
                 throw new ArgumentNullException(nameof(constructGetResponse));
             }
 
+            var beforeTransmitResult = _beforeTransmit != null ?
+                _beforeTransmit(commandApdu) : commandApdu;
+
             // prepare send buffer (Check Command APDU and convert it to an byte array)
             byte[] sendBuffer;
             try {
-                sendBuffer = commandApdu.ToArray();
+                sendBuffer = beforeTransmitResult.ToArray();
             } catch (InvalidOperationException exception) {
-                throw new InvalidApduException("Invalid APDU.", commandApdu, exception);
+                throw new InvalidApduException("Invalid APDU.", beforeTransmitResult, exception);
             }
 
             // prepare receive buffer (Response APDU)
-            var receiveBufferLength = commandApdu.ExpectedResponseLength; // expected size that shall be returned
+            var receiveBufferLength = beforeTransmitResult.ExpectedResponseLength; // expected size that shall be returned
             var receiveBuffer = new byte[receiveBufferLength];
 
             var receivePci = new SCardPCI();
@@ -215,13 +221,17 @@ namespace PCSC.Iso7816
                 responseApdu = SimpleTransmit(
                     sendBuffer,
                     sendBuffer.Length,
-                    commandApdu.Case, // ISO case used by the Command APDU
-                    commandApdu.Protocol, // Protocol used by the Command APDU
+                    beforeTransmitResult.Case, // ISO case used by the Command APDU
+                    beforeTransmitResult.Protocol, // Protocol used by the Command APDU
                     receivePci,
                     receiveBuffer,
-                    receiveBufferLength, afterTransmit);
+                    receiveBufferLength);
             } catch (WinErrorInsufficientBufferException ex) {
-                throw new InvalidApduException($"Unsufficient buffer: check Le size (Le={commandApdu.Le})", ex);
+                throw new InvalidApduException($"Unsufficient buffer: check Le size (Le={beforeTransmitResult.Le})", ex);
+            }
+
+            if (_afterTransmit != null) {
+                responseApdu = _afterTransmit(responseApdu);
             }
 
             /* Check status word SW1SW2:
@@ -231,7 +241,7 @@ namespace PCSC.Iso7816
              */
             if (responseApdu.SW1 == (byte) SW1Code.ErrorP3Incorrect) {
                 // Case 1: SW1=0x6c, Previous Le/P3 not accepted -> Set le = SW2
-                responseApdu = RetransmitOnInsufficientBuffer(commandApdu, responseApdu, out receivePci, afterTransmit);
+                responseApdu = RetransmitOnInsufficientBuffer(beforeTransmitResult, responseApdu, out receivePci);
             }
 
             // create Response object
@@ -239,8 +249,7 @@ namespace PCSC.Iso7816
 
             if (responseApdu.SW1 == (byte) SW1Code.NormalDataResponse) {
                 // Case 2: SW1=0x61, More data available -> GET RESPONSE
-                responseApdu = IssueGetResponseCommand(commandApdu, responseApdu, response, receivePci,
-                    constructGetResponse, afterTransmit);
+                responseApdu = IssueGetResponseCommand(commandApdu, responseApdu, response, receivePci, constructGetResponse);
             }
 
             response.Add(responseApdu);
@@ -254,7 +263,7 @@ namespace PCSC.Iso7816
             ResponseApdu previousResponseApdu,
             Response response,
             SCardPCI receivePci,
-            ConstructGetResponse constructGetResponse, Func<ResponseApdu, ResponseApdu> afterTransmit) {
+            ConstructGetResponse constructGetResponse) {
             /* The transmission system shall issue a GET RESPONSE command APDU (or TPDU)
              * to the card by assigning the minimum of SW2 and Le to parameter Le (or P3)).
              * Le = Le > 0 ? min(Le,SW2) : SW2
@@ -271,7 +280,11 @@ namespace PCSC.Iso7816
                 response.Add(receivePci);
 
                 var getResponseApdu = constructGetResponse(commandApdu, responseApdu, le);
-                le = getResponseApdu.Le;
+
+                var beforeTransmitResult = _beforeTransmit != null ?
+                    _beforeTransmit(getResponseApdu) : getResponseApdu;
+
+                le = beforeTransmitResult.Le;
 
                 // +2 bytes for status word
                 var receiveBufferLength = le == 0
@@ -281,7 +294,7 @@ namespace PCSC.Iso7816
                 var receiveBuffer = new byte[receiveBufferLength];
 
                 try {
-                    var sendBuffer = getResponseApdu.ToArray();
+                    var sendBuffer = beforeTransmitResult.ToArray();
 
                     // Shall we wait until we re-send we APDU/TPDU?
                     if (RetransmitWaitTime > 0) {
@@ -292,19 +305,23 @@ namespace PCSC.Iso7816
                     responseApdu = SimpleTransmit(
                         sendBuffer,
                         sendBuffer.Length,
-                        getResponseApdu.Case,
-                        getResponseApdu.Protocol,
+                        beforeTransmitResult.Case,
+                        beforeTransmitResult.Protocol,
                         receivePci,
                         receiveBuffer,
-                        receiveBufferLength, afterTransmit);
+                        receiveBufferLength);
                 } catch (WinErrorInsufficientBufferException ex) {
                     throw new InvalidApduException(
-                        $"GET RESPONSE command failed because of unsufficient buffer (Le={getResponseApdu.Le})",
-                        getResponseApdu, ex);
+                        $"GET RESPONSE command failed because of unsufficient buffer (Le={beforeTransmitResult.Le})",
+                        beforeTransmitResult, ex);
                 } catch (InvalidOperationException ex) {
                     throw new InvalidApduException(
                         "Got SW1=0x61. Retransmission failed because of an invalid GET RESPONSE APDU.",
-                        getResponseApdu, ex);
+                        beforeTransmitResult, ex);
+                }
+
+                if (_afterTransmit != null) {
+                    responseApdu = _afterTransmit(responseApdu);
                 }
 
                 // In case there is more data available.
@@ -319,7 +336,7 @@ namespace PCSC.Iso7816
         }
 
         private ResponseApdu RetransmitOnInsufficientBuffer(CommandApdu commandApdu, ResponseApdu responseApdu,
-            out SCardPCI receivePci, Func<ResponseApdu, ResponseApdu> afterTransmit) {
+            out SCardPCI receivePci) {
             int receiveBufferLength;
             var resendCmdApdu = (CommandApdu) commandApdu.Clone();
             if (responseApdu.SW2 == 0) {
@@ -349,7 +366,7 @@ namespace PCSC.Iso7816
                     resendCmdApdu.Protocol,
                     receivePci,
                     receiveBuffer,
-                    receiveBufferLength, afterTransmit);
+                    receiveBufferLength);
             } catch (WinErrorInsufficientBufferException ex) {
                 throw new InvalidApduException(
                     $"Retransmission failed because of unsufficient buffer. Le={resendCmdApdu.Le}", ex);
