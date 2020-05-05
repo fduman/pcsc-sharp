@@ -108,6 +108,8 @@ namespace PCSC.Iso7816
             : this(context, releaseContextOnDispose, beforeTransmit, afterTransmit) {
             _maxReceiveSize = maxReceiveSize;
             Connect(readerName, mode, protocol);
+            var sc = _reader.Reconnect(mode, protocol, SCardReaderDisposition.Reset);
+            sc.ThrowIfNotSuccess();
         }
 
         /// <summary>Constructs a command APDU using the active protocol of the reader.</summary>
